@@ -1,0 +1,185 @@
+import os
+import logging
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+from datetime import datetime, timedelta
+
+# Konfiguracja logowania
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("channel_cleanup.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Bezpieczne pobieranie tokenu z zmiennych środowiskowych
+slack_token = os.environ.get("SLACK_API_TOKEN")
+if not slack_token:
+    raise ValueError("SLACK_API_TOKEN environment variable not set")
+
+client = WebClient(token=slack_token)
+
+def read_whitelist():
+    try:
+        with open("whitelist.txt", "r") as f:
+            return [line.strip().lower() for line in f if line.strip()]
+    except FileNotFoundError:
+        logger.warning("Whitelist file not found, using empty whitelist")
+        return []
+
+whitelist = read_whitelist()
+
+def get_channel_info(channel_id):
+    try:
+        response = client.conversations_info(channel=channel_id)
+        if response["ok"]:
+            return response["channel"]
+    except SlackApiError as e:
+        logger.error(f"Error fetching channel info: {e.response['error']}")
+    return None
+
+def get_last_message(channel_id):
+    try:
+        response = client.conversations_history(channel=channel_id, limit=1)
+        if response["ok"] and response["messages"]:
+            return response["messages"][0]
+    except SlackApiError as e:
+        logger.error(f"Error fetching last message: {e.response['error']}")
+    return None
+
+def get_inactivity_duration(channel):
+    # Sprawdź ostatnią wiadomość lub datę utworzenia
+    last_message = get_last_message(channel["id"])
+    if last_message:
+        last_activity = datetime.fromtimestamp(float(last_message["ts"]))
+    else:
+        last_activity = datetime.fromtimestamp(float(channel["created"]))
+    
+    return datetime.now() - last_activity
+
+def send_notification(user_id, message):
+    try:
+        response = client.chat_postMessage(channel=user_id, text=message)
+        return response["ok"]
+    except SlackApiError as e:
+        if e.response['error'] == 'channel_not_found':
+            logger.warning(f"User {user_id} not found or cannot be messaged")
+        else:
+            logger.error(f"Error sending notification: {e.response['error']}")
+        return False
+
+def process_channels():
+    try:
+        channels = []
+        cursor = None
+        while True:
+            response = client.conversations_list(
+                types="public_channel,private_channel",
+                exclude_archived=True,
+                cursor=cursor
+            )
+            if not response["ok"]:
+                logger.error("Failed to fetch channels list")
+                break
+
+            channels.extend(response["channels"])
+            cursor = response.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+
+        for channel in channels:
+            process_single_channel(channel)
+
+    except SlackApiError as e:
+        logger.error(f"API error: {e.response['error']}")
+
+def process_single_channel(channel):
+    logger.info(f"Processing channel: {channel['name']} ({channel['id']})")
+    
+    if channel["name"].lower() in whitelist:
+        logger.info("Skipping whitelisted channel")
+        return
+
+    # Pomiń kanały już zarchiwizowane
+    if channel.get("is_archived"):
+        return
+
+    # Pobierz informacje o kanale
+    channel_info = get_channel_info(channel["id"])
+    if not channel_info:
+        return
+
+    creator_id = channel_info.get("creator")
+    if not creator_id:
+        logger.warning("Could not determine channel creator")
+        return
+
+    # Oblicz czas nieaktywności
+    try:
+        inactivity = get_inactivity_duration(channel_info)
+    except KeyError:
+        logger.error("Invalid channel data format")
+        return
+
+    # Wysyłaj powiadomienia i archiwizuj
+    if inactivity > timedelta(days=30):
+        archive_channel(channel["id"], channel["name"])
+    elif inactivity > timedelta(days=21):
+        notify_creator(channel_info, creator_id, inactivity)
+
+def notify_creator(channel, creator_id, inactivity):
+    remaining = timedelta(days=30) - inactivity
+    message = (
+        f"Channel #{channel['name']} has been inactive for {inactivity.days} days. "
+        f"It will be archived in {remaining.days} days if no activity occurs."
+    )
+    
+    if send_notification(creator_id, message):
+        logger.info("Notification sent to creator")
+    else:
+        logger.warning("Failed to notify creator")
+
+def archive_channel(channel_id, channel_name):
+    try:
+        # Wyślij ostateczne powiadomienie przed archiwizacją
+        housekeeping_msg = f"Channel #{channel_name} is being archived due to inactivity"
+        client.chat_postMessage(channel="#housekeeping", text=housekeeping_msg)
+        
+        response = client.conversations_archive(channel=channel_id)
+        if response["ok"]:
+            logger.info(f"Successfully archived channel {channel_name}")
+        else:
+            logger.error(f"Failed to archive channel: {response['error']}")
+    except SlackApiError as e:
+        logger.error(f"Error archiving channel: {e.response['error']}")
+
+def clean_old_archived():
+    try:
+        response = client.conversations_list(
+            types="public_channel,private_channel",
+            exclude_archived=False
+        )
+        
+        for channel in response["channels"]:
+            if channel.get("is_archived"):
+                created = datetime.fromtimestamp(float(channel["created"]))
+                if (datetime.now() - created) > timedelta(days=90):
+                    try:
+                        client.conversations_delete(channel=channel["id"])
+                        logger.info(f"Deleted old archived channel: {channel['name']}")
+                    except SlackApiError as e:
+                        if e.response['error'] == 'method_not_supported':
+                            logger.info(f"Skipping delete for channel {channel['name']} (plan restriction)")
+                        else:
+                            raise
+    except SlackApiError as e:
+        logger.error(f"Error cleaning archived channels: {e.response['error']}")
+
+if __name__ == "__main__":
+    logger.info("Starting channel cleanup process")
+    clean_old_archived()
+    process_channels()
+    logger.info("Process completed")
