@@ -5,6 +5,7 @@ from slack_sdk.errors import SlackApiError
 from datetime import datetime, timedelta
 
 # Konfiguracja logowania
+# PROTOTYP
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
